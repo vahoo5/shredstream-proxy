@@ -248,6 +248,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
 
     let entry_sender = Arc::new(BroadcastSender::new(100));
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
+    info!("Args: {args:?}");
     let forwarder_hdls = forwarder::start_forwarder_threads2(
         args.src_bind_addr,
         args.src_bind_port,
