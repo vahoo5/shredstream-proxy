@@ -246,35 +246,14 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(heartbeat_hdl);
     }
 
-    // share sockets between refresh and forwarder thread
-    let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
-        args.dest_ip_ports
-            .iter()
-            .map(|x| x.0)
-            .collect::<Vec<SocketAddr>>(),
-    ));
-
-    // share deduper + metrics between forwarder <-> accessory thread
-    // use mutex since metrics are write heavy. cheaper than rwlock
-    let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-        &mut rand::thread_rng(),
-        forwarder::DEDUPER_NUM_BITS,
-    )));
-
     let entry_sender = Arc::new(BroadcastSender::new(100));
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
-    let use_discovery_service =
-        args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
-    let forwarder_hdls = forwarder::start_forwarder_threads(
-        unioned_dest_sockets.clone(),
+    let forwarder_hdls = forwarder::start_forwarder_threads2(
         args.src_bind_addr,
         args.src_bind_port,
         args.num_threads,
-        deduper.clone(),
         args.grpc_service_port.is_some(),
         entry_sender.clone(),
-        args.debug_trace_shred,
-        use_discovery_service,
         forward_stats.clone(),
         metrics.clone(),
         shutdown_receiver.clone(),
@@ -282,36 +261,36 @@ fn main() -> Result<(), ShredstreamProxyError> {
     );
     thread_handles.extend(forwarder_hdls);
 
-    let report_metrics_thread = {
-        let exit = exit.clone();
-        spawn(move || {
-            while !exit.load(Ordering::Relaxed) {
-                sleep(Duration::from_secs(1));
-                forward_stats.report();
-            }
-        })
-    };
-    thread_handles.push(report_metrics_thread);
+    // let report_metrics_thread = {
+    //     let exit = exit.clone();
+    //     spawn(move || {
+    //         while !exit.load(Ordering::Relaxed) {
+    //             sleep(Duration::from_secs(1));
+    //             forward_stats.report();
+    //         }
+    //     })
+    // };
+    // thread_handles.push(report_metrics_thread);
 
-    let metrics_hdl = forwarder::start_forwarder_accessory_thread(
-        deduper,
-        metrics.clone(),
-        args.metrics_report_interval_ms,
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
-    thread_handles.push(metrics_hdl);
-    if use_discovery_service {
-        let refresh_handle = forwarder::start_destination_refresh_thread(
-            args.endpoint_discovery_url.unwrap(),
-            args.discovered_endpoints_port.unwrap(),
-            args.dest_ip_ports,
-            unioned_dest_sockets,
-            shutdown_receiver.clone(),
-            exit.clone(),
-        );
-        thread_handles.push(refresh_handle);
-    }
+    // let metrics_hdl = forwarder::start_forwarder_accessory_thread(
+    //     deduper,
+    //     metrics.clone(),
+    //     args.metrics_report_interval_ms,
+    //     shutdown_receiver.clone(),
+    //     exit.clone(),
+    // );
+    // thread_handles.push(metrics_hdl);
+    // if use_discovery_service {
+    //     let refresh_handle = forwarder::start_destination_refresh_thread(
+    //         args.endpoint_discovery_url.unwrap(),
+    //         args.discovered_endpoints_port.unwrap(),
+    //         args.dest_ip_ports,
+    //         unioned_dest_sockets,
+    //         shutdown_receiver.clone(),
+    //         exit.clone(),
+    //     );
+    //     thread_handles.push(refresh_handle);
+    // }
 
     if let Some(port) = args.grpc_service_port {
         let server_hdl = server::start_server_thread(
