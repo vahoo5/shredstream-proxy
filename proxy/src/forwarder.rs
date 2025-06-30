@@ -26,8 +26,7 @@ use solana_perf::{
 };
 use solana_sdk::clock::Slot;
 use solana_streamer::{
-    sendmmsg::{batch_send, SendPktsError},
-    streamer::{self, StreamerReceiveStats},
+    packet, sendmmsg::{batch_send, SendPktsError}, streamer::{self, StreamerReceiveStats}
 };
 use tokio::sync::broadcast::Sender;
 
@@ -42,21 +41,19 @@ pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 
+pub const NUM_PACKETS: usize = 1024 * 8;
+pub const PACKETS_PER_BATCH: usize = 64;
+pub const NUM_RCVMMSGS: usize = 64;
+
 pub fn start_forwarder_threads2(
     src_addr: IpAddr,
     src_port: u16,
     num_threads: Option<usize>,
-    should_reconstruct_shreds: bool,
     entry_sender: Arc<Sender<PbEntry>>,
-    forward_stats: Arc<StreamerReceiveStats>,
-    metrics: Arc<ShredMetrics>,
-    shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
     let num_threads = num_threads
         .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4));
-
-    let recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
 
     // multi_bind_in_range returns (port, Vec<UdpSocket>)
     let sockets = solana_net_utils::multi_bind_in_range_with_config(
@@ -69,40 +66,48 @@ pub fn start_forwarder_threads2(
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
 
-    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
-    let mut thread_hdls = Vec::with_capacity(num_threads + 1);
+    let incoming_shred_socket = sockets.1[0].try_clone()
+        .expect("to clone incoming shred socket for receiver thread");
+        
+    let res = incoming_shred_socket.set_read_timeout(Some(Duration::new(1, 0)));
+    assert!(res.is_ok(), "streamer::receiver set_read_timeout error");
+    let mut all_shreds = ahash::HashMap::<
+    Slot,
+    (
+        ahash::HashMap<u32, HashSet<ComparableShred>>,
+        ShredsStateTracker,
+    ),
+    >::default();
+    
+    let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
+    let mut deshredded_entries =
+        Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
+    let mut highest_slot_seen: Slot = 0;
+    let rs_cache = ReedSolomonCache::default();
 
-    if should_reconstruct_shreds {
-        let metrics = metrics.clone();
-        let exit = exit.clone();
-        // receives shreds from recv_from_channel_and_send_multiple_dest and calls deshred::reconstruct_shreds
-        let hdl = std::thread::Builder::new()
-            .name("shred_reconstructor".to_string())
-            .spawn(move || {
-                let mut all_shreds = ahash::HashMap::<
-                    Slot,
-                    (
-                        ahash::HashMap<u32, HashSet<ComparableShred>>,
-                        ShredsStateTracker,
-                    ),
-                >::default();
-                let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
-                    Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
-                let mut highest_slot_seen: Slot = 0;
-                let rs_cache = ReedSolomonCache::default();
+    let l = Builder::new()
+        .name("asd".to_string())
+        .spawn(move || {
+            'asd: loop {
+                let mut packet_batch = PacketBatch::with_capacity(PACKETS_PER_BATCH);
 
-                while !exit.load(Ordering::Relaxed) {
-                    match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
-                                pkt_batch,
+                loop {
+                    if exit.load(Ordering::Relaxed) {
+                        break 'asd;
+                    }
+        
+                    if let Ok(len) = packet::recv_from(&mut packet_batch, &incoming_shred_socket, Duration::default()) {
+                        if len > 0 {
+                            packet_batch
+                                .iter_mut()
+                                .for_each(|p| p.meta_mut().set_from_staked_node(false));
+                            deshred::reconstruct_shreds2(
+                                packet_batch,
                                 &mut all_shreds,
                                 &mut slot_fec_indexes_to_iterate,
                                 &mut deshredded_entries,
                                 &mut highest_slot_seen,
                                 &rs_cache,
-                                &metrics,
                             );
 
                             deshredded_entries.drain(..).for_each(
@@ -114,65 +119,13 @@ pub fn start_forwarder_threads2(
                                 },
                             );
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        break;
                     }
                 }
-            })
-            .unwrap();
-        thread_hdls.push(hdl);
-    };
-
-    sockets
-        .1
-        .into_iter()
-        .enumerate()
-        .flat_map(|(thread_id, incoming_shred_socket)| {
-            let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
-            let listen_thread = streamer::receiver(
-                format!("ssListen{thread_id}"),
-                Arc::new(incoming_shred_socket),
-                exit.clone(),
-                packet_sender,
-                recycler.clone(),
-                forward_stats.clone(),
-                Duration::default(),
-                false,
-                None,
-                false,
-            );
-
-            let shutdown_receiver = shutdown_receiver.clone();
-            let reconstruct_tx = reconstruct_tx.clone();
-            let exit = exit.clone();
-
-            let send_thread = Builder::new()
-                .name(format!("ssPxyTx_{thread_id}"))
-                .spawn(move || {
-                    while !exit.load(Ordering::Relaxed) {
-                        crossbeam_channel::select! {
-                            // forward packets
-                            recv(packet_receiver) -> maybe_packet_batch => {
-                                let packet_batch_res = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError);
-                                if packet_batch_res.is_err() {
-                                    break; // exit if channel is closed or error
-                                }
-                                let _ = reconstruct_tx.try_send(packet_batch_res.unwrap().clone());
-                            }
-
-                            // handle shutdown (avoid using sleep since it can hang)
-                            recv(shutdown_receiver) -> _ => {
-                                break;
-                            }
-                        }
-                    }
-                    info!("Exiting forwarder thread {thread_id}.");
-                })
-                .unwrap();
-
-            vec![listen_thread, send_thread]
+            }
         })
-        .collect::<Vec<JoinHandle<()>>>()
+        .unwrap();
+    vec![l]
 }
 
 /// Bind to ports and start forwarding shreds

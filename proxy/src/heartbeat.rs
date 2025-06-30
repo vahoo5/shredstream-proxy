@@ -162,18 +162,18 @@ pub fn heartbeat_loop_thread(
                         // possibly due to envoy losing track of the pod when backend restarts.
                         // we restart our grpc connection to work around the stale connection
                         // if no shreds received, then restart
-                        let new_received_count = metrics.agg_received_cumulative.load(Ordering::Relaxed);
-                        if new_received_count == last_cumulative_received_shred_count {
-                            warn!("No shreds received recently, restarting heartbeat client.");
-                            datapoint_warn!(
-                                "shredstream_proxy-heartbeat_restart_signal",
-                                "block_engine_url" => block_engine_url,
-                                ("desired_regions", format!("{desired_regions:?}"), String),
-                            );
-                            refresh_thread_hdl.abort();
-                            break;
-                        }
-                        last_cumulative_received_shred_count = new_received_count;
+                        // let new_received_count = metrics.agg_received_cumulative.load(Ordering::Relaxed);
+                        // if new_received_count == last_cumulative_received_shred_count {
+                        //     warn!("No shreds received recently, restarting heartbeat client.");
+                        //     datapoint_warn!(
+                        //         "shredstream_proxy-heartbeat_restart_signal",
+                        //         "block_engine_url" => block_engine_url,
+                        //         ("desired_regions", format!("{desired_regions:?}"), String),
+                        //     );
+                        //     refresh_thread_hdl.abort();
+                        //     break;
+                        // }
+                        // last_cumulative_received_shred_count = new_received_count;
 
 
                         successful_heartbeat_count_cumulative += successful_heartbeat_count;
